@@ -23,6 +23,7 @@ I needed an easy way to track my daily macros to achieve my fitness goals and an
 
 ## Architecture
 **Logging Food Macro Data**
+
 `log.py` --> dynamodb.put_item() --> DynamoDB --> Stream --> Lambda: Scan DynamoDB, Create JSON object, PUT --> S3
 
 `update_cost.py` --> dynamodb.update_item() --> DynamoDB
