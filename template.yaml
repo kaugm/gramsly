@@ -1,0 +1,305 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: API for personal use
+
+Parameters:
+  DataTable:
+    Type: String
+    Description: Name of DynamoDB Table
+    Default: Food-Data
+  MacrosTable:
+    Type: String
+    Description: DynamoDB Table with enrich data
+    Default: Enriched-Data
+  AlertEmail:
+    Type: String
+    Description: Email address to receive Lambda error notifications
+    Default: REDACTED
+
+
+Resources:
+  MyApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-API"
+      StageName: dev
+      Cors: # "'*'"
+        AllowMethods: "'GET,POST,DELETE,OPTIONS'"
+        AllowHeaders: "'*'"
+        AllowOrigin: "'*'"
+      EndpointConfiguration:
+        Type: REGIONAL
+      Domain:
+        DomainName: REDACTED
+        CertificateArn: REDACTED
+        EndpointConfiguration: REGIONAL
+        Route53:
+          HostedZoneId: REDACTED
+      Auth:
+        ApiKeyRequired: true # sets for all methods
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          Description: Usage plan for this API
+          Quota:
+            Limit: 60
+            Period: DAY
+          Throttle:
+            BurstLimit: 20
+            RateLimit: 2
+      DefinitionBody:
+        swagger: "2.0"
+        info:
+          title: "MacroTrackerAPI"
+          version: "1.0"
+        paths:
+          /log:
+            post:
+              summary: "Log consumed ingredient via Lambda"
+              consumes:
+                - "application/json"
+              produces:
+                - "application/json"
+              responses:
+                "200":
+                  description: "Successful response"
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                httpMethod: "POST"
+                uri:
+                  !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GenerateEnrichedData.Arn}/invocations"
+                passthroughBehavior: "when_no_match"
+
+
+# Lambda permission so API Gateway can invoke GenerateEnrichedData
+  GenerateEnrichedDataApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt GenerateEnrichedData.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MyApi}/*/POST/log"
+
+
+# DynamoDB to hold a list of all food macro data
+  FoodDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-Table-${DataTable}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+
+# DynamoDB to hold a list of all food macro data
+  FoodMacrosDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-Table-${MacrosTable}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+
+
+  # S3 Bucket to store JSON object containing food data
+  FoodDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-food-data-bucket"
+
+# "Spill Bucket" as required by Athena for DynamoDB
+  AthenaSpillBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-athena-spill-bucket"
+
+
+# Lambda function to generate JSON object for food data
+  GenerateJSONObject:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-Function-GenerateFoodMacrosJSON"
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      CodeUri: functions/generate_json
+      MemorySize: 128 # MB. Maximum memory 87MB
+      Timeout: 1 # Seconds. Maximum duration 299ms
+      Environment:
+        Variables:
+          FOOD_DATA_TABLE_NAME: !Ref FoodDataTable
+          FOOD_DATA_BUCKET: !Ref FoodDataBucket
+      Policies:
+      - DynamoDBReadPolicy:
+          TableName: !Ref FoodDataTable
+      - S3WritePolicy:
+          BucketName: !Ref FoodDataBucket
+      Events:
+        DynamoDBStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt FoodDataTable.StreamArn
+            StartingPosition: LATEST # Only care about new records
+            BatchSize: 1 # Only expecting one transaction to be sent at a time
+            Enabled: true
+
+
+# Lambda function to add hydrated data to DynamoDB table
+  GenerateEnrichedData:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-Function-GenerateEnrichedData"
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      CodeUri: functions/map_macros
+      MemorySize: 128 # MB. 97MB max duration
+      Timeout: 1 # Seconds. 397ms max duration
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FoodMacrosDataTable
+          BUCKET: !Ref FoodDataBucket
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName: !Ref FoodMacrosDataTable
+      - S3ReadPolicy:
+          BucketName: !Ref FoodDataBucket
+
+
+# IAM Role so that Grafana can query data using Athena
+  GrafanaAthenaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GrafanaAthenaRole
+      Description: Allows Grafana (from external account) to query Athena and read S3 data
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: REDACTED
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: REDACTED
+      Policies:
+        - PolicyName: GrafanaAthenaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # Athena: Run queries and manage workgroups
+              - Sid: AthenaQueryAccess
+                Effect: Allow
+                Action:
+                  - athena:GetDatabase
+                  - athena:GetDataCatalog
+                  - athena:GetTableMetadata
+                  - athena:ListDatabases
+                  - athena:ListDataCatalogs
+                  - athena:ListTableMetadata
+                  - athena:ListWorkGroups
+                Resource: '*'
+              - Sid: AthenaQueryAccess2
+                Effect: Allow
+                Action:
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:GetWorkGroup
+                  - athena:StartQueryExecution
+                  - athena:StopQueryExecution
+                Resource: '*'
+                # Condition:
+                #   "Null":
+                #     "aws:ResourceTag/GrafanaDataSource": "false"
+              - Sid: AllowGlue
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                Resource: '*'
+              # S3: Read source data and write Athena query results
+              - Sid: S3DataAccess
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListMultipartUploadParts
+                  - s3:AbortMultipartUpload
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt FoodDataBucket.Arn
+                  - !Sub "${FoodDataBucket.Arn}/*"
+                  - !GetAtt AthenaSpillBucket.Arn
+                  - !Sub "${AthenaSpillBucket.Arn}/*"
+              - Sid: AllowInvokeLambdaDynamoDBConnector
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: "arn:aws:lambda:us-east-1:REDACTED:function:dynamo"
+
+
+# SNS Topic for Lambda error alerts
+  LambdaErrorAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-LambdaErrorAlerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+
+# CloudWatch Alarm: alert on any GenerateEnrichedData Lambda error
+  GenerateEnrichedDataErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-GenerateEnrichedData-Errors"
+      AlarmDescription: Fires when GenerateEnrichedData Lambda throws an unhandled exception
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GenerateEnrichedData
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref LambdaErrorAlertTopic
+
+
+## Take a note of the outputs for deploying the workflow templates in this sample application
+Outputs:
+  ApiKey:
+    Description: "You can find your API Key in the AWS console: (Put in the request HEADER as 'x-api-key')"
+    Value: !Sub "https://console.aws.amazon.com/apigateway/home?region=${AWS::Region}#/api-keys/${MyApiApiKey}"
+  GrafanaAthenaRoleArn:
+    Description: ARN of the GrafanaAthenaRole
+    Value: !GetAtt GrafanaAthenaRole.Arn
+    Export:
+      Name: GrafanaAthenaRoleArn
+  LambdaErrorAlertTopicArn:
+    Description: SNS Topic ARN for Lambda error alerts
+    Value: !Ref LambdaErrorAlertTopic
+
+
